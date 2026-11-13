@@ -1,9 +1,9 @@
 //! Kymion audio engine: offline renderer, mixer, DSP effects chain, analysis, WAV export.
 
 use kymion_core::{
-    eval_auto, ClashSeverity, DiagnosticReport, FrequencyBand, FrequencyClash, FxInstance, FxKind,
-    LufsReport, Project, SoundfontConfig, SynthConfig, SynthFilter, Track, TrackKind, Waveform,
-    PPQ,
+    eval_auto, ClashSeverity, DiagnosticReport, Error, FrequencyBand, FrequencyClash, FxInstance,
+    FxKind, Limits, LufsReport, Project, Result as KResult, SoundfontConfig, SynthConfig,
+    SynthFilter, Track, TrackKind, Waveform, PPQ,
 };
 use kymion_dsp::{
     midi_to_hz, Adsr, AnalogAdsr, Compressor, Eq3Band, Filterbank6, KWeightingFilter, MoogLadder,
@@ -723,20 +723,48 @@ impl FullRender {
     }
 }
 
+/// Maximum bytes of f32 sample storage a single render may allocate.
+///
+/// A 10-minute 48 kHz project with the five internal buffers needs about
+/// 578 MiB, so this leaves headroom while still rejecting hostile lengths
+/// before sample buffers are constructed.
+pub const MAX_RENDER_BYTES: usize = 768 * 1024 * 1024;
+
 /// Render the whole project to stereo including track and master FX chains.
-pub fn render(p: &Project) -> Stereo {
+pub fn render(p: &Project) -> KResult<Stereo> {
     render_with(p, &RenderOptions::default())
 }
 
-pub fn render_with(p: &Project, opts: &RenderOptions) -> Stereo {
-    render_full(p, opts).master
+pub fn render_with(p: &Project, opts: &RenderOptions) -> KResult<Stereo> {
+    Ok(render_full(p, opts)?.master)
 }
 
-pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
+/// Renders the project after validating limits and the render byte budget.
+///
+/// Every length is checked before any sample buffer is allocated, so a
+/// hostile project cannot request a multi-terabyte sample vector.
+pub fn render_full(p: &Project, opts: &RenderOptions) -> KResult<FullRender> {
+    p.validate(&Limits::default())?;
     let sr = p.sample_rate;
     let srf = sr as f32;
     // Tail room for delays/reverbs (extra 2 seconds)
-    let total_samples = (p.ticks_to_secs(p.length_ticks()) * srf) as usize + sr as usize * 2;
+    let seconds = p.ticks_to_secs(p.length_ticks()) + 2.0;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(Error::Limit("project duration is not finite".into()));
+    }
+    let samples = (seconds * srf).ceil();
+    if !samples.is_finite() || samples > usize::MAX as f32 {
+        return Err(Error::Limit("project duration is too large".into()));
+    }
+    let total_samples = samples as usize;
+    let bytes = total_samples
+        .checked_mul(5 * std::mem::size_of::<f32>())
+        .ok_or_else(|| Error::Limit("render size overflows".into()))?;
+    if bytes > MAX_RENDER_BYTES {
+        return Err(Error::Limit(format!(
+            "render needs {bytes} bytes, above the {MAX_RENDER_BYTES}-byte budget"
+        )));
+    }
 
     let mut master_l: Vec<f32> = vec![0.0; total_samples];
     let mut master_r: Vec<f32> = vec![0.0; total_samples];
@@ -842,7 +870,7 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
         *s = s.tanh();
     }
 
-    FullRender {
+    Ok(FullRender {
         master: Stereo {
             sample_rate: sr,
             left: master_l,
@@ -850,7 +878,7 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
         },
         track_meters,
         track_energies,
-    }
+    })
 }
 
 /// Decode WAV bytes (8/16/24/32-bit int or 32-bit float) to mono f32 + sample rate.
@@ -1188,8 +1216,8 @@ pub fn analyze(s: &Stereo) -> Analysis {
 }
 
 /// Comprehensive mixing diagnostics for AI agents and audio engineers.
-pub fn diagnose(p: &Project) -> DiagnosticReport {
-    let full = render_full(p, &RenderOptions::default());
+pub fn diagnose(p: &Project) -> KResult<DiagnosticReport> {
+    let full = render_full(p, &RenderOptions::default())?;
     let lufs = calc_lufs(&full.master);
     let clashes = detect_frequency_clashes(&full.track_energies);
 
@@ -1219,11 +1247,11 @@ pub fn diagnose(p: &Project) -> DiagnosticReport {
         ));
     }
 
-    DiagnosticReport {
+    Ok(DiagnosticReport {
         lufs,
         clashes,
         summary,
-    }
+    })
 }
 
 /// 16-bit PCM stereo WAV bytes.
@@ -1297,7 +1325,7 @@ mod tests {
         })
         .unwrap();
 
-        let s = render(&e.project);
+        let s = render(&e.project).expect("render");
         let a = analyze(&s);
         assert!(a.peak > 0.02, "{a:?}");
         assert!(a.duration_sec > 2.0);
@@ -1343,7 +1371,7 @@ mod tests {
         })
         .unwrap();
 
-        let both = analyze(&render(&e.project)).rms;
+        let both = analyze(&render(&e.project).expect("render")).rms;
         // soloing the instrument must silence the audio clip (lower energy than both)
         e.apply(Command::SetMix {
             track: i,
@@ -1353,12 +1381,14 @@ mod tests {
             solo: Some(true),
         })
         .unwrap();
-        let solo = analyze(&render(&e.project)).rms;
+        let solo = analyze(&render(&e.project).expect("render")).rms;
         assert!(solo < both, "solo={solo} both={both}");
 
         // metronome adds energy
-        let plain = analyze(&render(&e.project)).rms;
-        let click = analyze(&render_with(&e.project, &RenderOptions { metronome: true })).rms;
+        let plain = analyze(&render(&e.project).expect("render")).rms;
+        let click =
+            analyze(&render_with(&e.project, &RenderOptions { metronome: true }).expect("render"))
+                .rms;
         assert!(click > plain);
 
         // gain automation to zero silences the track
@@ -1369,7 +1399,7 @@ mod tests {
             value: 0.0,
         })
         .unwrap();
-        assert!(analyze(&render(&e.project)).peak < 1e-6);
+        assert!(analyze(&render(&e.project).expect("render")).peak < 1e-6);
     }
 
     #[test]
@@ -1420,7 +1450,7 @@ mod tests {
         })
         .unwrap();
 
-        let full = render_full(&e.project, &RenderOptions::default());
+        let full = render_full(&e.project, &RenderOptions::default()).expect("render");
         assert_eq!(full.track_meters.len(), 1);
         let m = full.meters_at(0, 100);
         // Start of fade-in is near 0
@@ -1471,7 +1501,7 @@ mod tests {
             .unwrap();
         }
 
-        let s = render(&e.project);
+        let s = render(&e.project).expect("render");
         let a = analyze(&s);
         assert!(a.peak > 0.05);
         assert!(a.lufs.is_some());
@@ -1501,7 +1531,7 @@ mod tests {
             .unwrap();
         }
 
-        let diag = diagnose(&e.project);
+        let diag = diagnose(&e.project).expect("diagnose");
         assert!(!diag.summary.is_empty());
         // Verify frequency clashes are detected between the two competing bass tracks
         assert!(!diag.clashes.is_empty());
@@ -1540,5 +1570,40 @@ mod tests {
         assert_eq!(s.left.len(), s.right.len());
         let peak = s.left.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
         assert!(peak > 0.01, "Preview sound output was silent: {peak}");
+    }
+
+    #[test]
+    fn hostile_project_is_rejected_before_rendering() {
+        use kymion_core::Note;
+
+        let mut project = Project::new("hostile");
+        project.tempo = 20.0;
+        let mut track = Track::new(1, "lead", TrackKind::instrument(Waveform::Sine));
+        track.notes.push(Note {
+            id: 2,
+            start: u32::MAX - 10,
+            duration: 480,
+            pitch: 60,
+            velocity: 90,
+            lyric: None,
+            expression: None,
+        });
+        project.tracks.push(track);
+        let result = render_full(&project, &RenderOptions::default());
+        assert!(matches!(result, Err(Error::Limit(_))));
+    }
+
+    #[test]
+    fn malformed_soundfonts_never_panic() {
+        let mut state = 0x1234_5678_u32;
+        for len in [0usize, 1, 2, 3, 4, 16, 64, 255, 1024] {
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                bytes.push((state >> 16) as u8);
+            }
+            let presets = list_soundfont_presets(&bytes);
+            assert!(presets.len() < 1024);
+        }
     }
 }

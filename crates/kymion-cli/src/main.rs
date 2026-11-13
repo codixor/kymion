@@ -208,16 +208,19 @@ fn run(cli: Cli) -> Result<Value, String> {
             out,
             metronome,
         } => {
-            let s = render_with(&load(&path)?, &RenderOptions { metronome });
+            let s = render_with(&load(&path)?, &RenderOptions { metronome })
+                .map_err(|e| e.to_string())?;
             std::fs::write(&out, to_wav_bytes(&s)).map_err(|e| e.to_string())?;
             Ok(json!({"ok": true, "out": out, "analysis": analyze(&s)}))
         }
-        Cmd::Analyze { path } => Ok(
-            json!({"ok": true, "analysis": analyze(&render_with(&load(&path)?, &RenderOptions::default()))}),
-        ),
+        Cmd::Analyze { path } => {
+            let s =
+                render_with(&load(&path)?, &RenderOptions::default()).map_err(|e| e.to_string())?;
+            Ok(json!({"ok": true, "analysis": analyze(&s)}))
+        }
         Cmd::Diagnose { path } => {
             let p = load(&path)?;
-            let report = kymion_audio::diagnose(&p);
+            let report = kymion_audio::diagnose(&p).map_err(|e| e.to_string())?;
             Ok(json!({"ok": true, "diagnostic": report}))
         }
         Cmd::ImportAudio {

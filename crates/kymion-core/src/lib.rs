@@ -29,6 +29,8 @@ pub enum Error {
     SoundfontNotFound(u32),
     #[error("invalid argument: {0}")]
     Invalid(String),
+    #[error("limit exceeded: {0}")]
+    Limit(String),
     #[error("nothing to {0}")]
     NothingTo(&'static str),
     #[error("json: {0}")]
@@ -528,6 +530,75 @@ pub struct LufsReport {
     pub true_peak_db: f32,
 }
 
+/// Hard bounds applied to untrusted project JSON and render requests.
+///
+/// The defaults are the limits used by [Project::validate] and by the audio
+/// renderer before it allocates. They are deliberately conservative: a
+/// project inside these bounds must render in bounded time and memory.
+#[derive(Clone, Debug)]
+pub struct Limits {
+    /// Minimum accepted tempo in beats per minute.
+    pub min_tempo: f32,
+    /// Maximum accepted tempo in beats per minute.
+    pub max_tempo: f32,
+    /// Accepted sample rates. Defaults to 44.1 kHz and 48 kHz.
+    pub sample_rates: [u32; 2],
+    /// Maximum project length in seconds.
+    pub max_duration_secs: u32,
+    /// Maximum number of tracks.
+    pub max_tracks: usize,
+    /// Maximum notes on one track.
+    pub max_notes_per_track: usize,
+    /// Maximum notes across the project.
+    pub max_notes_total: usize,
+    /// Maximum embedded PCM clips.
+    pub max_assets: usize,
+    /// Maximum embedded SoundFonts.
+    pub max_soundfonts: usize,
+    /// Maximum decoded size of one embedded asset, in bytes.
+    pub max_asset_bytes: usize,
+    /// Maximum duration of one embedded PCM clip, in seconds.
+    pub max_audio_secs: u32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            min_tempo: 20.0,
+            max_tempo: 400.0,
+            sample_rates: [44_100, 48_000],
+            max_duration_secs: 600,
+            max_tracks: 64,
+            max_notes_per_track: 20_000,
+            max_notes_total: 100_000,
+            max_assets: 64,
+            max_soundfonts: 16,
+            max_asset_bytes: 64 * 1024 * 1024,
+            max_audio_secs: 600,
+        }
+    }
+}
+
+/// Largest note/clip tick position the command protocol accepts. This is the
+/// first tick past a maximum-length project at the maximum tempo.
+pub const MAX_TICK_POSITION: u32 = 1_920_000;
+
+/// Validates one note's pitch, velocity and bounded tick span.
+fn validate_note_span(start: u32, duration: u32, pitch: u8, velocity: u8) -> Result<()> {
+    if duration == 0 || pitch > 127 || velocity > 127 {
+        return Err(Error::Invalid("duration>0, pitch/velocity 0..127".into()));
+    }
+    let end = start
+        .checked_add(duration)
+        .ok_or_else(|| Error::Limit("note tick position overflows".into()))?;
+    if end > MAX_TICK_POSITION {
+        return Err(Error::Limit(
+            "note extends past the maximum tick position".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Overall mixing and acoustics diagnostic report for AI agents and producers.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct DiagnosticReport {
@@ -616,14 +687,14 @@ impl Project {
             .tracks
             .iter()
             .flat_map(|t| &t.notes)
-            .map(|n| n.start + n.duration)
+            .map(|n| n.start.saturating_add(n.duration))
             .max()
             .unwrap_or(0);
         let clips = self
             .tracks
             .iter()
             .flat_map(|t| &t.clips)
-            .map(|c| c.start + self.clip_len_ticks(c))
+            .map(|c| c.start.saturating_add(self.clip_len_ticks(c)))
             .max()
             .unwrap_or(0);
         notes.max(clips)
@@ -645,8 +716,132 @@ impl Project {
         self.next_id += 1;
         id
     }
+    /// Parses untrusted project JSON and applies [Limits::default].
+    ///
+    /// Validation covers tempo/sample-rate ranges, project length, track and
+    /// note counts, tick overflow, and embedded asset sizes before any audio
+    /// buffer is allocated.
     pub fn from_json(s: &str) -> Result<Self> {
-        Ok(serde_json::from_str(s)?)
+        let project: Self = serde_json::from_str(s)?;
+        project.validate(&Limits::default())?;
+        Ok(project)
+    }
+
+    /// Rejects projects outside the supplied resource bounds.
+    ///
+    /// This is the single gate used by JSON loading and the renderer. It does
+    /// not allocate proportional to untrusted sizes; embedded base64 payloads
+    /// are bounded by their encoded length before decoding.
+    pub fn validate(&self, limits: &Limits) -> Result<()> {
+        if !self.tempo.is_finite() || !(limits.min_tempo..=limits.max_tempo).contains(&self.tempo) {
+            return Err(Error::Limit(format!(
+                "tempo must be {}..={} bpm",
+                limits.min_tempo, limits.max_tempo
+            )));
+        }
+        if !limits.sample_rates.contains(&self.sample_rate) {
+            return Err(Error::Limit(format!(
+                "sample_rate must be one of {:?}",
+                limits.sample_rates
+            )));
+        }
+        if self.time_sig_num == 0 || self.time_sig_den == 0 {
+            return Err(Error::Limit("time signature must be positive".into()));
+        }
+        if self.tracks.len() > limits.max_tracks {
+            return Err(Error::Limit(format!(
+                "at most {} tracks are allowed",
+                limits.max_tracks
+            )));
+        }
+        if self.assets.len() > limits.max_assets {
+            return Err(Error::Limit(format!(
+                "at most {} audio assets are allowed",
+                limits.max_assets
+            )));
+        }
+        if self.soundfonts.len() > limits.max_soundfonts {
+            return Err(Error::Limit(format!(
+                "at most {} SoundFonts are allowed",
+                limits.max_soundfonts
+            )));
+        }
+        let max_encoded = limits.max_asset_bytes.saturating_mul(4) / 3 + 8;
+        for asset in &self.assets {
+            if asset.sample_rate == 0 || asset.sample_rate > 192_000 {
+                return Err(Error::Limit(format!(
+                    "asset {} has an invalid sample_rate",
+                    asset.id
+                )));
+            }
+            if asset.data.len() > max_encoded {
+                return Err(Error::Limit(format!("asset {} is too large", asset.id)));
+            }
+            let decoded = (asset.data.len() / 4).saturating_mul(3);
+            if decoded > limits.max_asset_bytes {
+                return Err(Error::Limit(format!("asset {} is too large", asset.id)));
+            }
+            let frames = decoded / 2;
+            let seconds = frames as u64 / u64::from(asset.sample_rate);
+            if seconds > u64::from(limits.max_audio_secs) {
+                return Err(Error::Limit(format!("asset {} is too long", asset.id)));
+            }
+        }
+        for soundfont in &self.soundfonts {
+            let encoded = (soundfont.data.len() / 4).saturating_mul(3);
+            if encoded > limits.max_asset_bytes {
+                return Err(Error::Limit(format!(
+                    "SoundFont {} is too large",
+                    soundfont.id
+                )));
+            }
+        }
+        let mut total_notes = 0usize;
+        for track in &self.tracks {
+            if track.notes.len() > limits.max_notes_per_track {
+                return Err(Error::Limit(format!(
+                    "track {} has too many notes",
+                    track.id
+                )));
+            }
+            total_notes = total_notes.saturating_add(track.notes.len());
+            for note in &track.notes {
+                if note.duration == 0 || note.pitch > 127 || note.velocity > 127 {
+                    return Err(Error::Invalid(
+                        "notes need duration>0 and pitch/velocity 0..127".into(),
+                    ));
+                }
+                let end = note.start.checked_add(note.duration).ok_or_else(|| {
+                    Error::Limit(format!("note {} tick position overflows", note.id))
+                })?;
+                if end > MAX_TICK_POSITION {
+                    return Err(Error::Limit(format!(
+                        "note {} extends past the maximum tick position",
+                        note.id
+                    )));
+                }
+            }
+            for clip in &track.clips {
+                let length = self.clip_len_ticks(clip);
+                clip.start.checked_add(length).ok_or_else(|| {
+                    Error::Limit(format!("clip {} tick position overflows", clip.id))
+                })?;
+            }
+        }
+        if total_notes > limits.max_notes_total {
+            return Err(Error::Limit(format!(
+                "at most {} notes are allowed",
+                limits.max_notes_total
+            )));
+        }
+        let seconds = self.ticks_to_secs(self.length_ticks());
+        if !seconds.is_finite() || seconds > limits.max_duration_secs as f32 {
+            return Err(Error::Limit(format!(
+                "project duration must be at most {} seconds",
+                limits.max_duration_secs
+            )));
+        }
+        Ok(())
     }
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("project serialises")
@@ -1014,9 +1209,7 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             velocity,
             lyric,
         } => {
-            if duration == 0 || pitch > 127 || velocity > 127 {
-                return Err(Error::Invalid("duration>0, pitch/velocity 0..127".into()));
-            }
+            validate_note_span(start, duration, pitch, velocity)?;
             let id = p.alloc();
             let t = p.track_mut(track)?;
             t.notes.push(Note {
@@ -1132,9 +1325,7 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
         },
         Command::AddNotes { track, notes } => {
             for n in &notes {
-                if n.duration == 0 || n.pitch > 127 || n.velocity > 127 {
-                    return Err(Error::Invalid("duration>0, pitch/velocity 0..127".into()));
-                }
+                validate_note_span(n.start, n.duration, n.pitch, n.velocity)?;
             }
             p.track(track)?;
             for n in notes {
@@ -1853,6 +2044,79 @@ mod tests {
                 assert_eq!(s.resonance, 0.65);
             }
             _ => panic!("Expected synth config"),
+        }
+    }
+
+    #[test]
+    fn hostile_note_start_is_rejected_on_load() {
+        let mut project = Project::new("hostile");
+        project.tempo = 20.0;
+        let mut track = Track::new(1, "lead", TrackKind::instrument(Waveform::Sine));
+        track.notes.push(Note {
+            id: 2,
+            start: u32::MAX - 10,
+            duration: 480,
+            pitch: 60,
+            velocity: 90,
+            lyric: None,
+            expression: None,
+        });
+        project.tracks.push(track);
+        let json = serde_json::to_string(&project).expect("test project serialises");
+        match Project::from_json(&json) {
+            Err(Error::Limit(_)) => {}
+            other => panic!("expected a typed limit error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_note_rejects_unbounded_start() {
+        let mut engine = Engine::default();
+        engine
+            .project
+            .tracks
+            .push(Track::new(1, "lead", TrackKind::instrument(Waveform::Sine)));
+        let result = engine.apply(Command::AddNote {
+            track: 1,
+            start: u32::MAX,
+            duration: 480,
+            pitch: 60,
+            velocity: 90,
+            lyric: None,
+        });
+        assert!(matches!(result, Err(Error::Limit(_))));
+        assert!(engine.project.tracks[0].notes.is_empty());
+    }
+
+    #[test]
+    fn oversized_asset_is_rejected_before_decode() {
+        let mut project = Project::new("assets");
+        project.assets.push(AudioAsset {
+            id: 1,
+            name: "clip".into(),
+            sample_rate: 44_100,
+            data: "AAAAAAAAAAAAAAAA".into(),
+        });
+        let limits = Limits {
+            max_asset_bytes: 3,
+            ..Limits::default()
+        };
+        assert!(matches!(project.validate(&limits), Err(Error::Limit(_))));
+    }
+
+    #[test]
+    fn malformed_json_never_panics() {
+        let mut state = 0x9e37_79b9_u32;
+        let alphabet =
+            b"{}[]\":,0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_/\\";
+        for len in 0..128usize {
+            let mut input = String::with_capacity(len);
+            for _ in 0..len {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let index = (state as usize) % alphabet.len();
+                input.push(alphabet[index] as char);
+            }
+            let _ = Project::from_json(&input);
         }
     }
 }

@@ -112,7 +112,9 @@ impl KymionEngine {
     /// Render with a metronome click (interleaved stereo f32).
     pub fn render_opts(&mut self, metronome: bool) -> Vec<f32> {
         self.ensure_render(metronome);
-        interleave(&self.cache.as_ref().unwrap().master)
+        self.cache
+            .as_ref()
+            .map_or_else(Vec::new, |c| interleave(&c.master))
     }
     pub fn sample_rate(&self) -> u32 {
         self.inner.project.sample_rate
@@ -123,16 +125,23 @@ impl KymionEngine {
     }
     pub fn wav(&mut self) -> Vec<u8> {
         self.ensure_render(false);
-        to_wav_bytes(&self.cache.as_ref().unwrap().master)
+        self.cache
+            .as_ref()
+            .map_or_else(Vec::new, |c| to_wav_bytes(&c.master))
     }
     pub fn analysis_json(&mut self) -> String {
         self.ensure_render(false);
-        serde_json::to_string(&analyze(&self.cache.as_ref().unwrap().master)).unwrap()
+        self.cache.as_ref().map_or_else(
+            || "{}".into(),
+            |c| serde_json::to_string(&analyze(&c.master)).unwrap_or_else(|_| "{}".into()),
+        )
     }
     /// Run comprehensive diagnostics (LUFS and frequency clashes) and return JSON report.
     pub fn diagnose_json(&self) -> String {
-        let diag = kymion_audio::diagnose(&self.inner.project);
-        serde_json::to_string(&diag).unwrap_or_else(|_| "{}".into())
+        match kymion_audio::diagnose(&self.inner.project) {
+            Ok(diag) => serde_json::to_string(&diag).unwrap_or_else(|_| "{}".into()),
+            Err(error) => serde_json::json!({"ok": false, "error": error.to_string()}).to_string(),
+        }
     }
     /// Render a single note audition preview for an interactive track (returns interleaved stereo f32).
     pub fn preview_note(
@@ -157,10 +166,7 @@ impl KymionEngine {
 
     fn ensure_render(&mut self, metronome: bool) {
         if self.cache.is_none() || self.cache_metro != metronome {
-            self.cache = Some(render_full(
-                &self.inner.project,
-                &RenderOptions { metronome },
-            ));
+            self.cache = render_full(&self.inner.project, &RenderOptions { metronome }).ok();
             self.cache_metro = metronome;
         }
     }
@@ -174,7 +180,9 @@ impl KymionEngine {
         metronome: bool,
     ) -> Vec<f32> {
         self.ensure_render(metronome);
-        let full = self.cache.as_ref().unwrap();
+        let Some(full) = self.cache.as_ref() else {
+            return Vec::new();
+        };
         let ml = &full.master.left;
         let mr = &full.master.right;
         let total = ml.len();

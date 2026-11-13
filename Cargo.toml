@@ -30,4 +30,3 @@ kymion-audio = { path = "crates/kymion-audio" }
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
