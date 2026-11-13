@@ -19,7 +19,13 @@ pub struct SoundfontPresetInfo {
     pub name: String,
 }
 
+/// Maximum SoundFont bytes accepted before rustysynth parses them.
+pub const MAX_SOUNDFONT_BYTES: usize = 64 * 1024 * 1024;
+
 pub fn list_soundfont_presets(bytes: &[u8]) -> Vec<SoundfontPresetInfo> {
+    if bytes.len() > MAX_SOUNDFONT_BYTES {
+        return vec![];
+    }
     let mut cursor = std::io::Cursor::new(bytes);
     let Ok(sf) = rustysynth::SoundFont::new(&mut cursor) else {
         return vec![];
@@ -177,7 +183,7 @@ fn render_soundfont_into(
         return;
     };
     let sf_bytes = sf_asset.bytes();
-    if sf_bytes.is_empty() {
+    if sf_bytes.is_empty() || sf_bytes.len() > MAX_SOUNDFONT_BYTES {
         return;
     }
     let mut cursor = std::io::Cursor::new(sf_bytes);
@@ -278,7 +284,7 @@ pub fn render_single_note_soundfont(
         return;
     };
     let sf_bytes = sf_asset.bytes();
-    if sf_bytes.is_empty() {
+    if sf_bytes.is_empty() || sf_bytes.len() > MAX_SOUNDFONT_BYTES {
         return;
     }
     let mut cursor = std::io::Cursor::new(sf_bytes);
